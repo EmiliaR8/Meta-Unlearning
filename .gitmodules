@@ -1,0 +1,3 @@
+[submodule "cicids_experiment_pipeline"]
+	path = cicids_experiment_pipeline
+	url = https://github.com/EmiliaR8/CICIDS_Experiment_Pipeline.git
