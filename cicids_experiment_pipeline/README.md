@@ -109,3 +109,4 @@ JSONs.
 These pipelines expect a pre-processed, `[0, 1]`-scaled CICIDS2017 HDF5
 file (default path `/mnt/processed_data/subsampled_dataset.h5`, override
 with `--h5-path`). The dataset itself is not included in this repository.
+Please reach out to the research team for this content.
