@@ -470,4 +470,4 @@ Each run writes `runs/<strategy>/<log_name>/`:
 
 These pipelines expect a pre-processed, `[0, 1]`-scaled CICIDS2017 HDF5 file
 (default `/mnt/processed_data/subsampled_dataset.h5`, override with `--h5-path`).
-The dataset is not included in this repository.
+The dataset is not included in this repository. Please contact the research team for this content.
