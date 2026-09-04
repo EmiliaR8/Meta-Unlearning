@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Thin launcher so commands work from anywhere in the repo.
+#
+#   ./iclr run   --dataset ember2018 --experiment madar --seed 1 --group demo
+#   ./iclr sweep --experiment naive joint madar --seed 1 2 3 --group demo
+#   ./iclr aggregate --group demo
+#   ./iclr plots     --group demo
+#   ./iclr paths --show
+#
+# `code/` is NOT a Python package on purpose: `code` is a standard-library
+# module name, and a package shadowing it on sys.path breaks pdb (which imports
+# it). Commands therefore run with code/ itself on the path, never the repo root.
+set -euo pipefail
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/code"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  run|sweep|aggregate|plots|paths|migrate) exec python3 -m "runner.$cmd" "$@" ;;
+  "") echo "usage: ./iclr {run|sweep|aggregate|plots|paths|migrate} [options]" >&2; exit 2 ;;
+  *)  echo "unknown command: $cmd (expected run|sweep|aggregate|plots|paths|migrate)" >&2; exit 2 ;;
+esac

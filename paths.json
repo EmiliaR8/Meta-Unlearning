@@ -1,0 +1,15 @@
+{
+  "_comment": [
+    "Committed path defaults. Resolution order, highest first:",
+    "  1. CLI flags       --data-root / --log-root / --cache-root",
+    "  2. environment     ICLR_DATA_ROOT / ICLR_LOG_ROOT / ICLR_CACHE_ROOT",
+    "  3. paths.local.json  (gitignored; per-machine overrides)",
+    "  4. this file",
+    "Values may be absolute, ~-prefixed, or relative to the repo root.",
+    "When the mount is created, set the three roots in paths.local.json ONLY.",
+    "Nothing else in the codebase hardcodes a path."
+  ],
+  "data_root": "Datasets",
+  "log_root": "Logs",
+  "cache_root": "Cache"
+}

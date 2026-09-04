@@ -482,7 +482,6 @@ def split_option_a_scrub_leftovers(X, y, families, budget_per_family):
 
 
 def split_option_b_donut_hole(X, y, families, model, forget_ratio=0.1):
-   "
     model.eval()
     mask = torch.isin(y, torch.tensor(families))
     if not mask.any():

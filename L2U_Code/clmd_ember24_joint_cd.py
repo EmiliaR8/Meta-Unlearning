@@ -122,7 +122,6 @@ class EmberNN(nn.Module):
 
 # --- 3. Training & Eval Functions ---
 def get_loader(X, y, families, drop_last=False):
-    .
     mask = torch.isin(y, torch.tensor(families))
     if not mask.any(): return None
     return data.DataLoader(data.TensorDataset(X[mask], y[mask]),
@@ -334,7 +333,6 @@ if __name__ == "__main__":
     with open(f'ember24_joint_history_cap{args.family_cap}_seed{SEED}.json', 'w') as f:
         json.dump(history, f, indent=2)
 
-    .
     plt.figure(figsize=(10, 6))
     plt.plot(history['Avg_Acc'], marker='o', label='Avg (seen families, micro)')
     plt.plot(history['Avg_Acc_Macro'], marker='s', label='Avg (macro, per-family mean)')

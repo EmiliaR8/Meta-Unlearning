@@ -1,0 +1,13 @@
+{
+  "_comment": [
+    "Copy to paths.local.json and edit. Gitignored, so it stays per-machine.",
+    "These are the real djarin/mount paths. Until the datasets and logs are",
+    "actually moved onto the mount, leave this file uncopied: paths.json falls",
+    "back to <repo>/Datasets and <repo>/Logs, which is where they are now.",
+    "After moving, copy this file and everything follows -- nothing else in the",
+    "codebase names a path."
+  ],
+  "data_root":  "/mnt/delucio/iclr/Datasets",
+  "log_root":   "/mnt/delucio/iclr/Logs",
+  "cache_root": "/mnt/delucio/iclr/Cache"
+}

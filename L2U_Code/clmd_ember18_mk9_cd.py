@@ -133,7 +133,6 @@ replay_buffer = []
 family_buffers = {}
 
 def get_loader(X, y, families, drop_last=False):
-    .
     mask = torch.isin(y, torch.tensor(families))
     if not mask.any(): return None
     return data.DataLoader(data.TensorDataset(X[mask], y[mask]),

@@ -125,7 +125,6 @@ def eval_acc(model, X, y, families, active_count):
 
 
 def eval_acc_macro(model, X, y, families, active_count):
- "
     model.eval()
     mask = torch.isin(y, torch.tensor(families))
     if not mask.any():

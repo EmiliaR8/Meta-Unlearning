@@ -1,0 +1,12 @@
+# per-machine storage roots -- never committed, this is the file that moves
+# when Datasets/ and Logs/ relocate to the mount
+paths.local.json
+
+# default in-repo storage locations (before the mount exists)
+/Datasets/
+/Logs/
+/Cache/
+
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/

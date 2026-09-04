@@ -177,7 +177,6 @@ if __name__ == "__main__":
     task0_mask = torch.isin(y_train, torch.tensor(task_families[0])).numpy()
     scaler.fit(X_train_np[task0_mask])
 
-  .
     X_train_scaled = torch.tensor(np.clip(scaler.transform(X_train_np), -FEATURE_CLIP, FEATURE_CLIP), dtype=torch.float32)
     X_test_scaled = torch.tensor(np.clip(scaler.transform(X_test_np), -FEATURE_CLIP, FEATURE_CLIP), dtype=torch.float32)
 
