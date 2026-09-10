@@ -1,0 +1,585 @@
+% ---------------------------------------------------------------------------
+% Methodology: MADAR + Unlearning
+%
+% SECTION BODY ONLY -- no \documentclass, no preamble. Drop into a paper with
+%   \input{docs/methodology_madar_unlearning}
+% or compile the preview wrapper docs/methodology_standalone.tex.
+%
+% Required packages (see the wrapper for a working preamble):
+%   amsmath, amssymb, booktabs, algorithm, algpseudocode, xcolor, hyperref
+%
+% Every equation, constant and default below is transcribed from the
+% implementation in code/; the trailing comment on a line names the source.
+% ---------------------------------------------------------------------------
+
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Problem setting and notation}
+\label{sec:method:notation}
+
+We study class-incremental learning over a stream of $T{+}1$ tasks. A task
+setup is written $C_0 + s \times T$: task $0$ introduces $C_0$ base families and
+each subsequent task $t \in \{1,\dots,T\}$ introduces $s$ previously unseen
+families, for $K = C_0 + sT$ classes in total.\footnote{\texttt{core/tasks.py}.
+The EMBER protocol is $50+5\times10$ ($K=100$); LAMDA is $30+5\times10$
+($K=80$).} Class indices follow \emph{presentation order}, so the classes
+introduced by task $t$ are
+\begin{equation}
+  \mathcal{C}_t =
+  \begin{cases}
+    \{0,\dots,C_0-1\}, & t = 0,\\[2pt]
+    \{C_0 + (t-1)s, \dots, C_0 + ts - 1\}, & t \ge 1,
+  \end{cases}
+\end{equation}
+and the \emph{active prefix} after task $t$ has width $a_t = C_0 + ts$, with
+$a_{-1} \coloneqq C_0$ by convention. Ordering the classes this way is what makes
+prefix masking well defined: it is not a cosmetic relabelling.
+
+Let $f_\theta : \mathcal{X} \to \mathbb{R}^{K}$ be the classifier, emitting a
+logit vector of full width $K$ at every stage, and let
+$h_\theta : \mathcal{X} \to \mathbb{R}^{d_{\text{lat}}}$ be its penultimate
+(latent) representation. Classes that have not yet arrived are suppressed by an
+additive mask rather than by reshaping the head,
+\begin{equation}
+  \label{eq:mask}
+  m^{(a)} \in \mathbb{R}^{K}, \qquad
+  m^{(a)}_j = \begin{cases} 0, & j < a, \\ -10^{9}, & j \ge a, \end{cases}
+\end{equation}
+so a single parameterisation carries the whole stream and no logit belonging to
+an unseen class can contribute to a loss or to an $\arg\max$.%
+\footnote{\texttt{core/training.py:logit\_mask}.}
+Table~\ref{tab:notation} collects the remaining symbols.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Notation, and where each quantity is realised in the implementation.}
+  \label{tab:notation}
+  \begin{tabular}{@{}llp{0.30\linewidth}@{}}
+    \toprule
+    Symbol & Meaning & Implementation \\
+    \midrule
+    $\mathcal{D}_t$ & training samples of task $t$ & \texttt{Experiment.task\_loader} \\
+    $a_t$ & active logit width after task $t$ & \texttt{TaskSchedule.active\_count} \\
+    $m^{(a)}$ & additive prefix mask, Eq.~\eqref{eq:mask} & \texttt{training.logit\_mask} \\
+    $\mathcal{M}_t$ & replay buffer after task $t$ & \texttt{core.buffer.ReplayBuffer} \\
+    $M$ & total buffer capacity & \texttt{mem\_size} \\
+    $\theta^{-}$ & frozen teacher & \texttt{training.clone\_teacher} \\
+    $\theta^{\text{pre}}_t$ & model before the forget phase & \texttt{pre} in \texttt{train\_task} \\
+    $\mathcal{F}_t,\ \mathcal{R}_t$ & forget / retain split of $\mathcal{D}_t$ & \texttt{select\_forget\_set} \\
+    $\rho$ & forget budget as a fraction of $|\mathcal{D}_t|$ & \texttt{forget\_ratio} \\
+    $\alpha$ & weight on the forget term & \texttt{alpha} \\
+    $\gamma_t$ & weight on the current-task term & \texttt{training.rnt\_for} \\
+    $\Omega,\ \theta^{\text{old}}$ & SI importances and anchor & \texttt{SynapticIntelligence} \\
+    $c$ & SI strength & \texttt{si\_c} \\
+    $\tau$ & distillation temperature & \texttt{kd\_temp} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Preprocessing.}
+Families enter the study only if they carry at least $200$ training samples, and
+the $K$ most frequent eligible families are retained. Feature standardisation is
+fit \emph{on task~0 alone} and applied to the whole stream, clipped to
+$\pm 10$ standard deviations; fitting on the full training set would leak the
+statistics of families the learner has not yet met into a protocol whose entire
+claim is that it has not met them. LAMDA's features are binary and are left
+unscaled.
+
+\subsection{Shared continual backbone}
+\label{sec:method:madar}
+
+All conditions share one training loop, one evaluation protocol and one
+determinism block, and differ only in the rule applied to a task
+(\texttt{experiments/base.py}). We describe that shared backbone first, because
+MADAR${+}$Unlearning is defined as a strict extension of it: everything in this
+subsection is common to both, so any difference measured between them is
+attributable to Section~\ref{sec:method:unlearn} alone.
+
+\paragraph{Task 0.}
+The base families are fit by ordinary supervised training for $E_0$ epochs with
+Adam,
+\begin{equation}
+  \label{eq:task0}
+  \min_\theta\ \mathbb{E}_{(x,y)\sim\mathcal{D}_0}
+    \big[\ \ell_{\mathrm{CE}}\!\big(f_\theta(x) + m^{(a_0)},\, y\big)\ \big].
+\end{equation}
+Afterwards the SI anchor is set, $\theta^{\text{old}} \leftarrow \theta$, the
+teacher is cloned, $\theta^{-} \leftarrow \theta$, and the buffer is filled from
+$\mathcal{D}_0$ by the rule of Section~\ref{sec:method:buffer}.
+
+\paragraph{Continual phase.}
+For each $t \ge 1$ the model is trained for a \emph{fixed iteration budget}
+$N_{\mathrm{cl}}$ rather than a fixed number of epochs, so that compute per task
+does not track task size. Each step draws one batch $(x,y) \sim \mathcal{D}_t$
+and one replay batch $(\tilde{x},\tilde{y}) \sim \mathcal{M}_{t-1}$ and minimises
+\begin{align}
+  \label{eq:cl}
+  \mathcal{L}^{\mathrm{CL}}_t
+   &= \gamma_t\,
+      \ell_{\mathrm{CE}}\!\big(f_\theta(x \cup \tilde{x}) + m^{(a_t)},\;
+                                y \cup \tilde{y}\big) \nonumber\\
+   &\quad + (1-\gamma_t)\,
+      \mathcal{L}_{\mathrm{KD}}\!\big(\tilde{x};\, \theta,\, \theta^{-},\, a_{t-1}\big)
+      \;+\; c\,\Omega(\theta),
+\end{align}
+where the distillation term is the temperature-scaled divergence \emph{from} the
+teacher \emph{to} the student, restricted to the previous active prefix,
+\begin{equation}
+  \label{eq:kd}
+  \mathcal{L}_{\mathrm{KD}}(x;\theta,\theta^{-},a)
+   = \tau^{2}\,
+     \mathrm{KL}\!\Big(
+       \sigma\big(f_{\theta^{-}}(x)_{:a}/\tau\big)
+       \,\Big\|\,
+       \sigma\big(f_{\theta}(x)_{:a}/\tau\big)
+     \Big),
+\end{equation}
+with $\sigma$ the softmax. Distillation is taken over \emph{replayed} samples
+only, which is why the implementation refuses the configuration
+$\texttt{use\_kd}\wedge\neg\texttt{use\_replay}$ outright rather than silently
+distilling on the current task.
+
+The convex weight is $\gamma_t = 1/(t+1)$, which weights every task seen so far
+equally. Three alternatives (\texttt{floor}, \texttt{sqrt}, \texttt{fixed}) are
+implemented and default to off; they exist because $1/(t+1)$ is principled only
+when tasks are interchangeable, and under a task~0 far larger than the
+increments the newest families receive a small share of the gradient. We note
+also that $\gamma_t$ is meaningful only \emph{as} a convex weight against the KD
+term: in an ablation that removes distillation, retaining $\gamma_t$ degenerates
+into a bare $1/(t+1)$ scalar on the whole objective --- a decaying learning rate
+in the costume of a replay weight. It is therefore disabled by default whenever
+KD is disabled.
+
+\paragraph{Synaptic Intelligence.}
+Parameter importance is the path integral of Zenke et al. During training, each
+optimiser step contributes
+\begin{equation}
+  \label{eq:si-accum}
+  W_k \;\mathrel{+}=\; -\,g_k \cdot \Delta\theta_k,
+\end{equation}
+with $g_k$ the pre-step gradient and $\Delta\theta_k$ the realised parameter
+change. At a task boundary the running sum is folded into the importances,
+normalised by the squared distance the parameter actually travelled,
+\begin{equation}
+  \label{eq:si-omega}
+  \Omega_k \;\mathrel{+}=\;
+    \frac{W_k}{\big(\theta_k - \theta^{\text{old}}_k\big)^{2} + \xi},
+  \qquad W_k \leftarrow 0,
+\end{equation}
+and the quadratic penalty charged during subsequent training is
+\begin{equation}
+  \label{eq:si-penalty}
+  \Omega(\theta) \;=\; \sum_k \Omega_k \big(\theta_k - \theta^{\text{old}}_k\big)^{2}.
+\end{equation}
+Whether the anchor $\theta^{\text{old}}$ advances at the boundary is a separate
+decision from whether $\Omega$ is updated, and Section~\ref{sec:method:order}
+turns on exactly that separation.
+
+\paragraph{Frozen normalisation statistics.}
+BatchNorm layers are held in evaluation mode for the entire continual phase.
+Their running statistics were estimated on task~0, and allowing a stream
+dominated by the newest families to overwrite them is a channel of forgetting
+that is unrelated to the weights and would otherwise be silently attributed to
+the training rule.
+
+\subsection{Diversity-aware replay buffer}
+\label{sec:method:buffer}
+
+The buffer holds at most $M$ samples and is budgeted uniformly across the
+families seen so far: with $F$ distinct families held or arriving, the
+per-family budget is $b = \max(1, \lfloor M / F \rfloor)$, existing families are
+truncated to $b$, and each arriving family is filled to $b$.
+
+Within a family, selection is MADAR's diversity criterion. An Isolation Forest
+is fitted over the family's samples and they are ordered ascending by
+$\mathrm{decision\_function}$, i.e. most anomalous first:
+\begin{equation}
+  \label{eq:buffer-order}
+  \pi = \operatorname{argsort}\big(\mathrm{IF}(\,\cdot\,)\big),
+  \qquad
+  \mathcal{M}^{(f)} = \operatorname{interleave}\big(
+     \pi_{1:\lfloor b/2 \rfloor},\;
+     \pi_{n - \lceil b/2 \rceil + 1 : n}\big),
+\end{equation}
+keeping the most anomalous half and the most prototypical half. The two ends are
+\emph{interleaved} rather than concatenated so that a later truncation to a
+smaller budget --- which takes a prefix of the stored list --- remains balanced
+between the two ends instead of retaining whichever end happens to sit first.
+
+Two spaces are selectable for the forest. Fitting on the scaled \emph{input}
+features (\texttt{--buffer-space raw}) is MADAR as published: selection is then a
+fixed property of the data. Fitting on the classifier's latent representation
+$h_\theta$ (\texttt{latent}, the default here; MADAR-$\theta$) makes selection
+move as the model learns. The distinction is not cosmetic --- it decides whether
+the memory is chosen in a fixed space or in one the learner is simultaneously
+reshaping --- and it is recorded per run.\footnote{The Isolation Forest's
+\texttt{contamination} parameter appears in the configuration but only shifts the
+estimator's decision \emph{threshold}. Selection here is purely rank-based on
+$\mathrm{decision\_function}$ scores, so its value does not change which samples
+are chosen; it is retained because the estimator requires it.}
+
+\subsection{MADAR + Unlearning}
+\label{sec:method:unlearn}
+
+The proposed condition is the backbone of Section~\ref{sec:method:madar} with a
+\emph{forget phase} appended to every task $t \ge 1$. A fraction of the task the
+model has just learned is nominated for deletion, the model is trained to become
+uninformative about it, and the replay buffer is rebuilt so that the deleted
+samples cannot return. The phase runs \emph{after} the continual phase, so the
+setting is learn-then-forget: the samples in question have already been fit.
+Algorithm~\ref{alg:madaru} states the whole procedure; the subsections that
+follow justify the parts that are not mechanical.
+
+\begin{algorithm}[t]
+\caption{MADAR${+}$Unlearning, one task $t \ge 1$}
+\label{alg:madaru}
+\begin{algorithmic}[1]
+  \Require model $\theta$, teacher $\theta^{-}$, buffer $\mathcal{M}_{t-1}$,
+           SI state $(W,\Omega,\theta^{\text{old}})$
+  \State $\theta \gets \textsc{ContinualPhase}(\theta,\theta^{-},\mathcal{D}_t,\mathcal{M}_{t-1})$
+         \Comment{Eq.~\eqref{eq:cl}, $N_{\mathrm{cl}}$ steps}
+  \State $\Omega \gets \textsc{FoldImportances}(W,\theta,\theta^{\text{old}})$
+         \Comment{Eq.~\eqref{eq:si-omega}; anchor \emph{not} advanced}
+  \State $(\mathcal{F}_t, \mathcal{R}_t) \gets \textsc{Select}(\mathcal{D}_t, \rho)$
+         \Comment{Section~\ref{sec:method:select}}
+  \If{$\mathcal{F}_t = \emptyset$}
+      \State advance anchor, refresh teacher, rebuild buffer from $\mathcal{D}_t$;
+             \textbf{return}
+  \EndIf
+  \State $\theta^{\text{pre}} \gets \theta$ \Comment{frozen; teacher and reference}
+  \For{$e = 1$ \textbf{to} $E_u$}
+    \For{minibatch $x_f \subset \mathcal{F}_t$}
+      \State draw $x_r \sim \mathcal{R}_t$, \; $\tilde{x} \sim \mathcal{M}_{t-1}$
+      \State $\theta \gets \theta - \eta_u \nabla_\theta \mathcal{L}^{U}$
+             \Comment{Eq.~\eqref{eq:unlearn}}
+    \EndFor
+  \EndFor
+  \State $\textsc{Measure}(\theta^{\text{pre}}, \theta, \mathcal{F}_t, \mathcal{R}_t)$
+         \Comment{Section~\ref{sec:method:efficacy}}
+  \State $\theta^{\text{old}} \gets \theta$;\quad $\theta^{-} \gets \theta$
+  \State $\mathcal{M}_t \gets \textsc{RebuildBuffer}(\mathcal{M}_{t-1}, \mathcal{R}_t)$
+         \Comment{retain split only}
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Ordering of the SI boundary}
+\label{sec:method:order}
+
+The task boundary is closed \emph{before} the forget phase, but the anchor is
+deliberately held back: Eq.~\eqref{eq:si-omega} is applied with
+$\theta^{\text{old}}$ left pointing at the parameters as they stood at the
+\emph{start} of task $t$, and it advances only once unlearning is complete
+(lines 2 and 13 of Algorithm~\ref{alg:madaru}).
+
+This ordering is load-bearing in both directions. Folding $W$ into $\Omega$
+first means the importances already account for what task $t$ made important, so
+the forget phase is constrained by a current estimate rather than a stale one.
+Withholding the anchor means the penalty in Eq.~\eqref{eq:si-penalty} is
+evaluated against the start of the task, so unlearning is charged for every
+important parameter it drags away from that point. Had the anchor advanced
+first, $\theta - \theta^{\text{old}} = 0$ at the moment the forget phase begins
+and the regulariser would be identically inert for precisely the phase it is
+meant to regulate.
+
+We note for completeness that the path integral is \emph{not} accumulated during
+the forget phase --- Eq.~\eqref{eq:si-accum} is applied only inside the
+continual phase, since $W$ has already been consumed at line~2. The unlearning
+trajectory is therefore regularised by SI but does not itself contribute to
+future importance estimates.
+
+\subsubsection{Forget-set selection}
+\label{sec:method:select}
+
+Selection partitions the current task's samples into
+$\mathcal{D}_t = \mathcal{F}_t \sqcup \mathcal{R}_t$ under a budget
+$k = \lfloor \rho\,|\mathcal{D}_t| \rfloor$ that is held \emph{fixed across
+selectors}. Holding the budget fixed is what makes a comparison between rules
+attributable to \emph{which} samples are named rather than to how many. The
+seed for the decision is derived, $\mathrm{seed}_t = \mathrm{child}(\mathrm{seed}, t, 7)$,
+rather than drawn from the global stream, so that introducing a selector cannot
+shift every later random draw in the run and thereby de-pair two conditions
+intended to share a seed. If $k = 0$ the phase is skipped and the run record
+says so explicitly.
+
+Three rules are compared.
+
+\begin{description}
+  \item[\texttt{random}] A uniform subset of size $k$. This is the control for
+    \emph{which} samples: it isolates the effect of the selection rule from the
+    effect of deleting $k$ samples at all.
+
+  \item[\texttt{donut}] (default) An Isolation Forest is fitted jointly over the
+    task in latent space, samples are ordered ascending by
+    $\mathrm{decision\_function}$, and the forget set is the \emph{middle band}
+    of that ordering,
+    \begin{equation}
+      \label{eq:donut}
+      \mathcal{F}_t = \pi_{\,j:\,j+k},
+      \qquad j = \Big\lfloor \tfrac{n}{2} \Big\rfloor - \Big\lfloor \tfrac{k}{2} \Big\rfloor .
+    \end{equation}
+    Both the most anomalous and the most prototypical samples are kept. This
+    applies MADAR's own prior --- the criterion it uses to \emph{choose} what to
+    remember, Eq.~\eqref{eq:buffer-order} --- to the complementary question of
+    what to delete, and is the hand-crafted rule the learned policy is later
+    measured against.
+
+  \item[\texttt{leftover}] A per-family Isolation Forest in \emph{raw} feature
+    space; each family keeps the anomalous/prototypical halves that a
+    MADAR-style selection at the current per-family budget would have kept, and
+    everything else is forgotten. This rule ignores $\rho$ by construction: the
+    forget set is whatever the buffer budget leaves over, which is typically far
+    larger than a $10\%$ slab. Comparisons involving it are therefore not
+    budget-matched, and we report it as such.
+\end{description}
+
+\subsubsection{The forget objective}
+\label{sec:method:objective}
+
+Let $\theta^{\text{pre}}$ denote the model at the end of the continual phase,
+frozen and used both as the distillation teacher for this phase and as the
+reference for efficacy measurement. The retain anchor is therefore ``what the
+model believed a moment ago'', not the previous task's model. Writing
+$u = \mathbf{1}/s$ for the uniform distribution over the $s = a_t - a_{t-1}$
+classes this task introduced, the phase minimises
+\begin{align}
+  \label{eq:unlearn}
+  \mathcal{L}^{U}
+   &= \alpha\,
+      \underbrace{\mathrm{KL}\!\Big(u \,\Big\|\,
+        \sigma\big(f_\theta(x_f)_{a_{t-1}:a_t}\big)\Big)}_{\text{forget}}
+      \nonumber\\
+   &\quad + (1-\alpha)\,
+      \underbrace{\Big[
+        \tfrac{1}{2}\,\ell_{\mathrm{CE}}\big(f_\theta(x_\cup) + m^{(a_t)},\, y_\cup\big)
+        + \tfrac{1}{2}\,\mathcal{L}_{\mathrm{KD}}\big(x_\cup; \theta, \theta^{\text{pre}}, a_t\big)
+      \Big]}_{\text{retain}}
+      \nonumber\\
+   &\quad + c\,\Omega(\theta),
+\end{align}
+where $x_f \subset \mathcal{F}_t$ and
+$(x_\cup, y_\cup) = (x_r,y_r) \cup (\tilde{x},\tilde{y})$ concatenates a batch of
+this task's \emph{retained} samples with a replay batch from the buffer. The
+forget set defines the step count; the retain and replay streams cycle to match
+it. Optimisation uses Adam at $\eta_u$ for $E_u$ passes over $\mathcal{F}_t$,
+with gradient-norm clipping at $0.5$ and BatchNorm still frozen.
+
+Three properties of Eq.~\eqref{eq:unlearn} should be read carefully.
+
+\emph{The forget term acts on the new-task slice only.} The softmax is taken over
+$[a_{t-1}, a_t)$ --- the $s$ classes this task introduced --- not over the full
+active prefix. The objective therefore drives the model toward indifference
+\emph{among the new families}, which is a narrower claim than indifference among
+all classes seen so far.
+
+\emph{Retention is anchored on two populations.} Because $x_\cup$ mixes retained
+current-task samples with replayed old-family samples, the $(1-\alpha)$ term
+defends both plasticity on the task being partially forgotten and stability on
+everything before it, under one weight.
+
+\emph{The regulariser is not slack.} By Section~\ref{sec:method:order}, $\Omega$
+is evaluated against the start of the task, so the forget term must overcome an
+active quadratic penalty on exactly those parameters the task made important.
+
+\subsubsection{Buffer reconstruction from the retain split}
+\label{sec:method:rebuild}
+
+After the forget phase the buffer is rebuilt from $\mathcal{R}_t$ rather than
+$\mathcal{D}_t$: latents are recomputed with the \emph{post}-unlearning model and
+Eq.~\eqref{eq:buffer-order} is re-applied per family. Forgotten samples are
+consequently never eligible for replay at any later task.
+
+This is worth separating from the objective, because it is a second and
+independent deletion mechanism, and it operates whenever a forget set is selected
+--- including when $\alpha = 0$. It is the reason the ablation of
+Section~\ref{sec:method:controls} is necessary rather than decorative.
+
+\subsubsection{Efficacy measurement}
+\label{sec:method:efficacy}
+
+Unlearning is measured, per task, by comparing $\theta^{\text{pre}}$ against the
+post-phase $\theta$ on the same inputs, over two disjoint scopes: the forget set
+$\mathcal{F}_t$ and the retained current-task samples $\mathcal{R}_t$. For each
+scope we record accuracy before and after, the mean predictive entropy and its
+normalised form, and the displacement of the latent representation:
+\begin{align}
+  \label{eq:efficacy}
+  H(x) &= -\!\!\sum_{j < a_t} p_j \log p_j,
+  \qquad p = \sigma\big(f_{\theta}(x)_{:a_t}\big), \\
+  \widehat{H} &= \frac{\mathbb{E}[H(x)]}{\log a_t},
+  \qquad
+  \Delta_{\text{lat}}(x) = \big\| h_{\theta}(x) - h_{\theta^{\text{pre}}}(x) \big\|_2 .
+\end{align}
+A useful result is a large drop in accuracy and a large $\Delta_{\text{lat}}$ on
+$\mathcal{F}_t$ together with small movement on $\mathcal{R}_t$: forgetting that
+also flattens the retained samples is collateral damage, not deletion. Note that
+$\widehat{H}$ is normalised over the \emph{full} active prefix while the forget
+term of Eq.~\eqref{eq:unlearn} operates on the $s$-class slice, so a forget set
+driven to perfect uniformity within that slice will not register
+$\widehat{H} \approx 1$; the two widths are not interchangeable and we report
+$\widehat{H}$ as a monotone diagnostic rather than as a saturating one.
+
+\subsection{Conditions, controls and ablations}
+\label{sec:method:controls}
+
+Four conditions share the network, the family selection, the scaler, the task
+schedule, the masked evaluation and the determinism block. Only the rule applied
+to a task differs.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{The four conditions. All share every non-training component.}
+  \label{tab:conditions}
+  \begin{tabular}{@{}lp{0.62\linewidth}@{}}
+    \toprule
+    Condition & Training rule \\
+    \midrule
+    Naive & Fine-tune on the current task only. Lower bound. \\
+    Joint & Discard the model and retrain from scratch on all data seen so far.
+            Oracle upper bound; not a realisable continual setup. \\
+    MADAR & Eq.~\eqref{eq:cl}: diversity-aware replay, distillation against the
+            previous task's model, SI penalty. \\
+    MADAR${+}$U & MADAR, plus the per-task forget phase of
+            Section~\ref{sec:method:unlearn}. \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{$\alpha = 0$ is the matched control.}
+The headline comparison is not MADAR${+}$U against MADAR. At $\alpha = 0$ the
+forget set is still selected by the same rule, is still excluded from the buffer
+rebuild, and the same number of gradient steps is still taken --- only the push
+toward uniform is absent. The contrast $\alpha > 0$ versus $\alpha = 0$ therefore
+isolates the value of the \emph{forget objective}, while $\alpha = 0$ versus
+MADAR isolates the value of \emph{curation}, i.e. of removing those samples from
+memory at all. Reporting the method without the $\alpha = 0$ arm would attribute
+to unlearning what may simply be memory curation, and both arms are run for every
+corpus and seed.
+
+\paragraph{Component ablations.}
+Replay, distillation and the SI penalty are independently switchable in
+Eq.~\eqref{eq:cl} so that an ablation removes exactly one thing. SI is ablated by
+setting $c = 0$, which leaves the optimiser, the iteration count and the data
+order untouched; removing distillation additionally disables $\gamma_t$ for the
+reason given in Section~\ref{sec:method:madar}.
+
+\subsection{Evaluation protocol}
+\label{sec:method:eval}
+
+After every task, predictions are taken as
+$\hat{y} = \arg\max_{j < a_t} f_\theta(x)_j$ over the test split, and all
+reported quantities are derived from a single confusion matrix so that the
+numbers in a record are mutually consistent by construction rather than by three
+code paths agreeing. Three scopes are evaluated:
+\begin{itemize}
+  \item \textbf{seen} --- all families encountered so far. The headline number.
+  \item \textbf{recent} --- the families just introduced. Acquisition, i.e.
+        plasticity.
+  \item \textbf{task0} --- the base families. Retention, i.e. resistance to
+        forgetting.
+\end{itemize}
+The \textbf{seen} scope averages the other two, so a method that trades
+acquisition against retention is invisible in it alone; we report all three.
+
+Macro averages are taken over classes \emph{with support in the evaluation
+slice}. A class absent from a slice has no recall to measure, and scoring it as
+zero would make the metric a function of which classes happen to be absent.
+Because a class may be predicted without being present, the false positives such
+predictions generate belong to no scored class; they are surfaced explicitly as
+\texttt{n\_pred\_outside\_support} rather than dropped. For single-label
+multiclass, micro-precision, micro-recall and micro-F1 all equal accuracy, so
+only accuracy is reported under that name.
+
+Two protocol constraints are enforced rather than documented. First, the
+\texttt{stage1} protocol (task~0 retrained per seed) and the \texttt{meta}
+protocol (a shared task-0 checkpoint) are never differenced against each other,
+and are tabulated as separate blocks. Second, a crashed run is recorded as failed
+and is never scored, defaulted or interpolated --- a missing number that silently
+becomes \texttt{NaN} and then sorts to the top of a ranking is a real failure
+mode, and the sweep boundary is where it is refused.
+
+\subsection{Hyperparameters}
+\label{sec:method:hparams}
+
+Table~\ref{tab:hparams} gives the values in effect. Per-corpus entries are
+protocol for that corpus; an explicit override always wins and, whatever wins,
+the resolved value is written into the run record --- there is no value in effect
+that the log does not name.
+
+\begin{table}[t]
+  \centering
+  \small
+  \caption{Protocol parameters. Shared values are common to every corpus.}
+  \label{tab:hparams}
+  \begin{tabular}{@{}llcccc@{}}
+    \toprule
+    & & EMBER 2018 & EMBER 2024 & LAMDA & Tiny ImageNet \\
+    \midrule
+    \multicolumn{6}{@{}l}{\emph{Shared}}\\
+    Task-0 epochs $E_0$        & \texttt{task0\_epochs}   & \multicolumn{3}{c}{30, Adam $10^{-3}$} & 50 \\
+    Batch size                 & \texttt{batch\_size}     & \multicolumn{3}{c}{256} & 32 \\
+    Continual optimiser        & ---                      & \multicolumn{4}{c}{SGD, momentum $0.9$, weight decay $10^{-6}$, clip $1.0$} \\
+    Distillation temperature   & \texttt{kd\_temp}        & \multicolumn{4}{c}{$\tau = 2.0$} \\
+    Current-task weight        & \texttt{rnt\_mode}       & \multicolumn{4}{c}{$\gamma_t = 1/(t{+}1)$} \\
+    Forget weight              & \texttt{alpha}           & \multicolumn{4}{c}{$\alpha \in \{0.2,\ 0\}$ (both arms)} \\
+    Forget budget              & \texttt{forget\_ratio}   & \multicolumn{4}{c}{$\rho = 0.10$} \\
+    Forget passes              & \texttt{unlearn\_epochs} & \multicolumn{3}{c}{$E_u = 3$} & 3 \\
+    Forget optimiser           & \texttt{unlearn\_lr}     & \multicolumn{4}{c}{Adam $\eta_u = 10^{-4}$, clip $0.5$} \\
+    Family eligibility         & \texttt{min\_family\_samples} & \multicolumn{3}{c}{$\ge 200$} & --- \\
+    \midrule
+    \multicolumn{6}{@{}l}{\emph{Per corpus}}\\
+    Schedule                   & \texttt{--task-setup}    & $50{+}5{\times}10$ & $50{+}5{\times}10$ & $30{+}5{\times}10$ & $100{+}10{\times}10$ \\
+    Continual budget $N_{\mathrm{cl}}$ & \texttt{cl\_iters} & 2000 & 8000 & 4000 & 3000 \\
+    Continual lr               & \texttt{cl\_lr}          & $10^{-4}$ & $10^{-4}$ & $10^{-4}$ & $0.03$ \\
+    Buffer capacity $M$        & \texttt{mem\_size}       & 5000 & 10000 & 2500 & 2000 \\
+    SI strength $c$            & \texttt{si\_c}           & 1.0 & 100.0 & 100.0 & 1.0 \\
+    Per-family cap             & \texttt{family\_cap}     & --- & 10000 & --- & --- \\
+    Feature clip               & \texttt{feature\_clip}   & $\pm10$ & $\pm10$ & --- (binary) & --- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Threats to validity}
+\label{sec:method:threats}
+
+\paragraph{Compute is not matched between MADAR and MADAR${+}$U.}
+The forget phase adds $E_u \lceil |\mathcal{F}_t| / B \rceil$ optimiser steps per
+task on top of the $N_{\mathrm{cl}}$ continual steps, and the run record reports
+the total. The difference is small relative to $N_{\mathrm{cl}}$ but it is not
+zero, so a MADAR${+}$U improvement over MADAR is confounded with additional
+gradient steps. The $\alpha = 0$ arm of Section~\ref{sec:method:controls} is
+matched in step count and is the comparison from which the forget objective's
+contribution should be read.
+
+\paragraph{The forget objective and the efficacy metric span different widths.}
+As noted in Section~\ref{sec:method:efficacy}, $\mathcal{L}^U$ flattens the
+$s$-class new-task slice while $\widehat{H}$ normalises over the full active
+prefix of width $a_t$. The two are consistent in direction but not on a common
+scale.
+
+\paragraph{Unlearning is behavioural, not certified.}
+Eq.~\eqref{eq:unlearn} drives the model's \emph{predictions} on $\mathcal{F}_t$
+toward uniformity and removes those samples from memory; it offers no guarantee
+of indistinguishability from a model retrained without them, and we make no such
+claim. The reported quantities of Section~\ref{sec:method:efficacy} are evidence
+of behavioural forgetting under a specific probe, and the \texttt{Joint} oracle
+of Table~\ref{tab:conditions} is a retraining reference for accuracy, not a
+privacy reference.
+
+\paragraph{The \texttt{leftover} selector is not budget-matched.}
+Its forget set is determined by the buffer budget rather than by $\rho$, so
+differences against \texttt{random} and \texttt{donut} confound the selection
+rule with the number of samples deleted.
+
+\paragraph{Reproduction.}
+Every reported run is produced by a single command and writes one self-describing
+JSON record naming the corpus, the schedule, the model and parameter count, every
+hyperparameter in effect, the seed, the protocol, the library versions, the GPU
+and the git commit:
+\begin{verbatim}
+./iclr run --dataset ember2018 --task-setup ember \
+           --experiment madar_unlearn --selector donut \
+           --model full --seed 1 --group <group>
+\end{verbatim}

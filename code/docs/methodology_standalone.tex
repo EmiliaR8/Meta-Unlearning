@@ -1,0 +1,32 @@
+% ---------------------------------------------------------------------------
+% Preview wrapper. Compiles the methodology section on its own:
+%
+%   cd code/docs && pdflatex methodology_standalone.tex && pdflatex methodology_standalone.tex
+%
+% (twice, so \ref and \eqref resolve). To use the section in a paper, do NOT
+% use this file -- \input{docs/methodology_madar_unlearning} directly and take
+% the package list below into your own preamble.
+%
+% Note on Table `tab:hparams': it is six columns wide and is laid out for a
+% SINGLE-column page. In a two-column template, wrap the tabular in
+% \resizebox{\linewidth}{!}{...} (needs graphicx) or move it to a table*.
+% ---------------------------------------------------------------------------
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\title{MADAR + Unlearning --- methodology}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\input{methodology_madar_unlearning}
+\end{document}
